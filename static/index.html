@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reddit Pain Point Miner</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2em; }
+        .category { margin: 1em 0; border: 1px solid #ccc; border-radius: 6px; }
+        .category-header { background: #f0f0f0; padding: 0.5em; cursor: pointer; font-weight: bold; }
+        .problems { display: none; padding: 0.5em 1em; }
+        .problem { margin-bottom: 0.5em; border-bottom: 1px solid #eee; padding-bottom: 0.5em; }
+        .toast { background: #4caf50; color: white; padding: 1em; border-radius: 5px; position: fixed; top: 1em; right: 1em; display: none; }
+        .input-row { margin-bottom: 1em; }
+        .input-row input, .input-row button { font-size: 1em; padding: 0.5em; }
+        .spinner { display: none; margin-left: 1em; vertical-align: middle; }
+        .spinner div {
+            width: 18px; height: 18px; border: 3px solid #ccc; border-top: 3px solid #4caf50; border-radius: 50%; animation: spin 1s linear infinite;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <h1>Reddit Pain Point Miner</h1>
+    <div class="input-row">
+        <input id="subreddit" type="text" placeholder="Enter subreddit (e.g. HybridAthlete)" />
+        <select id="numPosts" style="margin-left:0.5em;">
+            <option value="5">5 posts</option>
+            <option value="10" selected>10 posts</option>
+            <option value="20">20 posts</option>
+            <option value="50">50 posts</option>
+            <option value="100">100 posts</option>
+        </select>
+        <button id="scanBtn" onclick="runScan()">Scan Subreddit</button>
+        <span class="spinner" id="spinner"><div></div></span>
+        <span id="progressMsg" style="margin-left:1em;color:#555;"></span>
+    </div>
+    <div class="input-row">
+        <select id="subredditSelect" onchange="onSubredditSelect()">
+            <option value="">-- Select subreddit --</option>
+        </select>
+        <button id="clearBtn" onclick="clearData()">Clear Data</button>
+    </div>
+    <div id="toast" class="toast"></div>
+    <div id="summary"></div>
+    <script>
+        let currentSubreddit = '';
+        let progressInterval = null;
+        let lastProgressStatus = '';
+        async function runScan() {
+            const subreddit = document.getElementById('subreddit').value.trim();
+            const numPosts = parseInt(document.getElementById('numPosts').value, 10);
+            const scanBtn = document.getElementById('scanBtn');
+            const spinner = document.getElementById('spinner');
+            const progressMsg = document.getElementById('progressMsg');
+            if (!subreddit) { alert('Please enter a subreddit.'); return; }
+            scanBtn.disabled = true;
+            spinner.style.display = 'inline-block';
+            progressMsg.textContent = '';
+            showToast('Scanning subreddit...');
+            progressInterval = setInterval(() => pollProgress(subreddit), 1000);
+            await fetch('/scan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subreddit, total_posts: numPosts })
+            })
+            .then(r => r.json())
+            .then(data => showToast(data.message || 'Scan complete!'))
+            .catch(() => showToast('Error running scan.'));
+        }
+        async function pollProgress(subreddit) {
+            const progressMsg = document.getElementById('progressMsg');
+            const spinner = document.getElementById('spinner');
+            const scanBtn = document.getElementById('scanBtn');
+            try {
+                const res = await fetch(`/scan_progress?subreddit=${encodeURIComponent(subreddit)}`);
+                const prog = await res.json();
+                if (prog.status === 'scanning') {
+                    progressMsg.textContent = `${prog.posts_scanned}/${prog.total_posts} posts scanned, ${prog.problems_found} problems found`;
+                    lastProgressStatus = 'scanning';
+                } else if (prog.status === 'done') {
+                    progressMsg.textContent = `Scan complete: ${prog.posts_scanned} posts scanned, ${prog.problems_found} problems found.`;
+                    spinner.style.display = 'none';
+                    scanBtn.disabled = false;
+                    clearInterval(progressInterval);
+                    progressInterval = null;
+                    setTimeout(() => {
+                        loadSubreddits();
+                        setTimeout(() => {
+                            document.getElementById('subredditSelect').value = subreddit;
+                            onSubredditSelect();
+                        }, 500);
+                    }, 500);
+                } else {
+                    if (lastProgressStatus === 'scanning') {
+                        progressMsg.textContent = 'Finalizing...';
+                    } else {
+                        progressMsg.textContent = '';
+                        spinner.style.display = 'none';
+                        scanBtn.disabled = false;
+                        clearInterval(progressInterval);
+                        progressInterval = null;
+                    }
+                }
+            } catch (e) {
+                progressMsg.textContent = '';
+                spinner.style.display = 'none';
+                scanBtn.disabled = false;
+                clearInterval(progressInterval);
+                progressInterval = null;
+            }
+        }
+        async function clearData() {
+            document.getElementById('summary').innerHTML = '';
+            document.getElementById('subredditSelect').value = '';
+            currentSubreddit = '';
+            showToast('Frontend data cleared!');
+        }
+        async function loadSummary(subreddit = '') {
+            const container = document.getElementById('summary');
+            container.innerHTML = '';
+            if (!subreddit) return;
+            const res = await fetch(`/summary?subreddit=${encodeURIComponent(subreddit)}`);
+            const summary = await res.json();
+            summary.forEach((catObj, idx) => {
+                const catDiv = document.createElement('div');
+                catDiv.className = 'category';
+                const header = document.createElement('div');
+                header.className = 'category-header';
+                header.innerHTML = `${catObj.category} (Total upvotes: ${catObj.total_upvotes}) <span style="float:right">[+]</span>`;
+                header.onclick = function() {
+                    const p = catDiv.querySelector('.problems');
+                    if (p.style.display === 'block') {
+                        p.style.display = 'none';
+                        header.querySelector('span').textContent = '[+]';
+                    } else {
+                        p.style.display = 'block';
+                        header.querySelector('span').textContent = '[-]';
+                    }
+                };
+                catDiv.appendChild(header);
+                const problemsDiv = document.createElement('div');
+                problemsDiv.className = 'problems';
+                catObj.problems.forEach(prob => {
+                    const probDiv = document.createElement('div');
+                    probDiv.className = 'problem';
+                    probDiv.innerHTML = `<b>Comment:</b> ${prob.problem}<br>
+                        <b>Upvotes:</b> ${prob.upvotes} | <b>Author:</b> ${prob.author} | <a href="${prob.comment_url}" target="_blank">View Comment</a> <span style="color:#888">[${prob.subreddit}]</span>`;
+                    problemsDiv.appendChild(probDiv);
+                });
+                catDiv.appendChild(problemsDiv);
+                container.appendChild(catDiv);
+            });
+        }
+        async function loadSubreddits() {
+            const res = await fetch('/subreddits');
+            const subreddits = await res.json();
+            const select = document.getElementById('subredditSelect');
+            const prev = select.value;
+            select.innerHTML = '<option value="">-- Select subreddit --</option>';
+            subreddits.forEach(sub => {
+                const opt = document.createElement('option');
+                opt.value = sub;
+                opt.textContent = sub;
+                select.appendChild(opt);
+            });
+            if (subreddits.includes(prev)) {
+                select.value = prev;
+                onSubredditSelect();
+            }
+        }
+        function onSubredditSelect() {
+            const select = document.getElementById('subredditSelect');
+            currentSubreddit = select.value;
+            loadSummary(currentSubreddit);
+        }
+        function showToast(msg) {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.style.display = 'block';
+            setTimeout(() => { toast.style.display = 'none'; }, 3000);
+        }
+        // Initial load
+        loadSubreddits();
+    </script>
+</body>
+</html> 
