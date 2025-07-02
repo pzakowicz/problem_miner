@@ -5,7 +5,7 @@ import requests.auth
 import re
 import time
 from datetime import datetime
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -54,6 +54,17 @@ class ScanRequest(BaseModel):
     batch_size: int = 20
     total_posts: int = 50
 
+class LabelRequest(BaseModel):
+    subreddit: str
+    problem_id: str
+    problem_text: str
+    context: str = ''
+    label: str
+    notes: str = ''
+
+class SubredditDeleteRequest(BaseModel):
+    subreddit: str
+
 # Global scan progress tracker
 scan_progress = {}
 scan_progress_lock = Lock()
@@ -83,6 +94,7 @@ def create_table(conn, table):
                 comment_id TEXT UNIQUE,
                 author TEXT,
                 problem TEXT,
+                context TEXT,
                 category TEXT,
                 upvotes INTEGER,
                 created_at TEXT,
@@ -92,22 +104,21 @@ def create_table(conn, table):
 
 # Helper: Save a matched problem to DB (deduplication via UNIQUE)
 def save_problem(conn, table, data):
+    # Get actual column order for the table
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table})")
+    columns = [row[1] for row in cursor.fetchall() if row[1] != 'id']  # skip autoincrement id
+    # Build values in the correct order
+    values = []
+    for col in columns:
+        values.append(data.get(col, None))
+    placeholders = ', '.join(['?'] * len(columns))
+    col_names = ', '.join(columns)
     with conn:
         conn.execute(f'''
-            INSERT OR IGNORE INTO {table} (subreddit, post_title, post_id, comment_id, author, problem, category, upvotes, created_at, comment_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            data['subreddit'],
-            data['post_title'],
-            data['post_id'],
-            data['comment_id'],
-            data['author'],
-            data['problem'],
-            data['category'],
-            data['upvotes'],
-            data['created_at'],
-            data['comment_url']
-        ))
+            INSERT OR IGNORE INTO {table} ({col_names})
+            VALUES ({placeholders})
+        ''', tuple(values))
 
 # Helper: Recursively extract all comments (including nested)
 def extract_comments(comment_list, results):
@@ -268,70 +279,70 @@ def assign_category_openai(problem, categories, subreddit):
         print(f"OpenAI API error (assign cat): {e}")
         return categories[0]
 
-def extract_and_categorize_problem_openai(text, categories=None):
+def extract_and_categorize_problem_openai(text, categories=None, post_title=None):
     """
     Uses OpenAI to extract a quoted problem statement and assign a category in a single call.
-    If categories is None, only extracts the problem.
-    Returns (problem, category) or (None, None) if no problem is found.
+    The extracted problem should include any necessary context inside the quoted text.
+    Returns (problem, context, category) or (None, None, None) if no problem is found.
     """
     if not openai or not OPENAI_API_KEY or not text.strip():
-        return None, None
+        return None, None, None
     openai.api_key = OPENAI_API_KEY
+    context_intro = f"Post title: {post_title}\n" if post_title else ""
     if categories:
         cat_list = ', '.join(categories)
         prompt = (
-            "Does the following text describe a real problem, pain point, or challenge? "
-            f"If yes, quote the sentence or two (exactly as written) that best describe the problem, and assign it to one of these categories: {cat_list}. "
-            "Reply in this format:\nPROBLEM: \"quoted problem\"\nCATEGORY: category_name\nIf not, reply 'NO PROBLEM'.\n\n"
-            f"Text: '''{text}'''"
+            f"{context_intro}Comment or post body: {text}\n\n"
+            "Does the above text contain a clear, personal problem or pain point, written in first-person? "
+            "Ignore general advice, facts, or opinions that do not describe the user's own problem. "
+            "If yes, quote exactly the full sentence or 2–3 consecutive sentences that best describe the problem, "
+            "including any context needed, all inside PROBLEM. Do not create a separate CONTEXT field. "
+            f"Assign it to one of these categories: {cat_list}.\n"
+            "Reply only in this format:\nPROBLEM: \"quoted problem with context\"\nCATEGORY: category_name\n"
+            "If there is no clear, personal problem, reply 'NO PROBLEM'."
         )
     else:
         prompt = (
-            "Does the following text describe a real problem, pain point, or challenge? "
-            "If yes, quote the sentence or two (exactly as written) that best describe the problem. "
-            "If not, reply 'NO PROBLEM'.\n\n"
-            f"Text: '''{text}'''"
+            f"{context_intro}Comment or post body: {text}\n\n"
+            "Does the above text contain a clear, personal problem or pain point, written in first-person? "
+            "Ignore general advice, facts, or opinions that do not describe the user's own problem. "
+            "If yes, quote exactly the full sentence or 2–3 consecutive sentences that best describe the problem, "
+            "including any context needed, all inside PROBLEM. Do not create a separate CONTEXT field. "
+            "Reply only in this format:\nPROBLEM: \"quoted problem with context\"\n"
+            "If there is no clear, personal problem, reply 'NO PROBLEM'."
         )
     try:
         response = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are an expert at identifying and categorizing real problems in online discussions."},
+                {"role": "system", "content": "You are an expert at detecting real, personal problems in online discussions and only extracting genuine user-expressed complaints or challenges."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=128,
+            max_tokens=256,
             temperature=0
         )
         result = response.choices[0].message.content.strip()  # type: ignore
         if result.upper() == 'NO PROBLEM' or not result:
-            return None, None
-        if categories:
-            # Expecting format: PROBLEM: "..."\nCATEGORY: ...
-            lines = result.split('\n')
-            problem = None
-            category = None
-            for line in lines:
-                if line.strip().startswith('PROBLEM:'):
-                    problem = line.split('PROBLEM:',1)[1].strip().strip('"')
-                elif line.strip().startswith('CATEGORY:'):
-                    category = line.split('CATEGORY:',1)[1].strip()
-            if not problem:
-                # fallback: try to find quoted text
-                import re
-                m = re.search(r'"([^"]+)"', result)
-                if m:
-                    problem = m.group(1)
-            return problem, category
-        else:
-            # Only problem extraction
+            return None, None, None
+        # Parse response
+        problem = None
+        category = None
+        for line in result.split('\n'):
+            if line.strip().startswith('PROBLEM:'):
+                problem = line.split('PROBLEM:', 1)[1].strip().strip('"')
+            elif line.strip().startswith('CATEGORY:'):
+                category = line.split('CATEGORY:', 1)[1].strip()
+        # Fallback: try to find quoted text for problem
+        if not problem:
             import re
             m = re.search(r'"([^"]+)"', result)
             if m:
-                return m.group(1), None
-            return result, None
+                problem = m.group(1)
+        return problem, None, category
     except Exception as e:
         print(f"OpenAI API error (extract & categorize): {e}")
-        return None, None
+        return None, None, None
+
 
 @app.get("/scan_progress")
 def get_scan_progress(subreddit: str):
@@ -342,14 +353,62 @@ def get_scan_progress(subreddit: str):
         return {"status": "idle"}
     return prog
 
+def migrate_add_context_column():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'pain_points_%'")
+    tables = [row[0] for row in cursor.fetchall()]
+    for table in tables:
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'context' not in columns:
+            try:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN context TEXT")
+                print(f"Added 'context' column to {table}")
+            except Exception as e:
+                print(f"Migration error for {table}: {e}")
+    conn.commit()
+    # Verify all tables have the context column
+    for table in tables:
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = [row[1] for row in cursor.fetchall()]
+        print(f"Schema for {table}: {columns}")
+        if 'context' not in columns:
+            raise RuntimeError(f"Table {table} is missing 'context' column after migration!")
+    conn.close()
+
+def migrate_add_labels_table():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS problem_labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subreddit TEXT,
+            problem_id TEXT,
+            problem_text TEXT,
+            context TEXT,
+            label TEXT,
+            notes TEXT,
+            created_at TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Call migration at startup
+migrate_add_context_column()
+migrate_add_labels_table()
+
 @app.post("/scan")
 def scan_subreddit(req: ScanRequest):
-    subreddit = req.subreddit.strip()
+    migrate_add_context_column()
+    subreddit = str(req.subreddit or '').strip()
     batch_size = req.batch_size
     total_posts = req.total_posts
     table = f"pain_points_{subreddit.lower()}"
     token = get_token()
     headers = {'Authorization': f'bearer {token}', 'User-Agent': USER_AGENT}
+    # Close and reopen connection
     conn = sqlite3.connect(DB_PATH, timeout=30)
     create_table(conn, table)
     n_posts = 0
@@ -389,13 +448,13 @@ def scan_subreddit(req: ScanRequest):
                 post_body = post_data.get('selftext', '')
                 if post_body.strip():
                     if not categories and len(sample_problems) < sample_limit:
-                        problem, _ = extract_and_categorize_problem_openai(post_body)
+                        problem, context, _ = extract_and_categorize_problem_openai(post_body, None, post_title)
                         if problem:
                             sample_problems.append(problem)
                             if len(sample_problems) >= sample_limit:
                                 categories = get_or_generate_categories(subreddit, sample_problems)
                     else:
-                        problem, category = extract_and_categorize_problem_openai(post_body, categories)
+                        problem, context, category = extract_and_categorize_problem_openai(post_body, categories, post_title)
                         if problem and category:
                             n_problems += 1
                             with scan_progress_lock:
@@ -407,6 +466,7 @@ def scan_subreddit(req: ScanRequest):
                                 'comment_id': post_id,  # Use post_id as comment_id for original post
                                 'author': post_data.get('author'),
                                 'problem': problem,
+                                'context': context,
                                 'category': category,
                                 'upvotes': post_data.get('score', 0),
                                 'created_at': datetime.utcfromtimestamp(post_data.get('created_utc', 0)).isoformat() if post_data.get('created_utc') else None,
@@ -427,13 +487,13 @@ def scan_subreddit(req: ScanRequest):
                     if not body.strip():
                         continue
                     if not categories and len(sample_problems) < sample_limit:
-                        problem, _ = extract_and_categorize_problem_openai(body)
+                        problem, context, _ = extract_and_categorize_problem_openai(body, None, post_title)
                         if problem:
                             sample_problems.append(problem)
                             if len(sample_problems) >= sample_limit:
                                 categories = get_or_generate_categories(subreddit, sample_problems)
                     else:
-                        problem, category = extract_and_categorize_problem_openai(body, categories)
+                        problem, context, category = extract_and_categorize_problem_openai(body, categories, post_title)
                         if problem and category:
                             n_problems += 1
                             with scan_progress_lock:
@@ -445,6 +505,7 @@ def scan_subreddit(req: ScanRequest):
                                 'comment_id': c.get('id'),
                                 'author': c.get('author'),
                                 'problem': problem,
+                                'context': context,
                                 'category': category,
                                 'upvotes': c.get('score', 0),
                                 'created_at': datetime.utcfromtimestamp(c.get('created_utc', 0)).isoformat() if c.get('created_utc') else None,
@@ -457,6 +518,7 @@ def scan_subreddit(req: ScanRequest):
         # If categories were never generated (not enough samples), generate with what we have
         if not categories:
             categories = get_or_generate_categories(subreddit, sample_problems)
+        remove_non_good_and_deduplicate(conn, table, subreddit)
     finally:
         with scan_progress_lock:
             scan_progress[key]["status"] = "done"
@@ -465,22 +527,25 @@ def scan_subreddit(req: ScanRequest):
 
 @app.get("/summary")
 def get_summary(subreddit: str = Query(None)):
+    migrate_add_context_column()
+    # Reopen connection after migration
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     all_rows = []
-    if subreddit:
+    subr = str(subreddit or '')
+    if subr:
         # Only aggregate from the table for the selected subreddit
-        table_name = f"pain_points_{subreddit}"
+        table_name = f"pain_points_{subr}"
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         if cursor.fetchone():
-            cursor.execute(f"SELECT category, problem, upvotes, author, comment_url, subreddit FROM {table_name}")
+            cursor.execute(f"SELECT category, problem, context, post_title, upvotes, author, comment_url, subreddit FROM {table_name}")
             all_rows.extend(cursor.fetchall())
     else:
         # No subreddit selected, return empty list
         conn.close()
         return []
     summary = {}
-    for cat, problem, upvotes, author, url, subreddit in all_rows:
+    for cat, problem, context, post_title, upvotes, author, url, subreddit in all_rows:
         if not cat:
             cat = 'Uncategorized'
         if cat not in summary:
@@ -488,6 +553,8 @@ def get_summary(subreddit: str = Query(None)):
         summary[cat]["total_upvotes"] += upvotes
         summary[cat]["problems"].append({
             "problem": problem,
+            "context": context,
+            "post_title": post_title,
             "upvotes": upvotes,
             "author": author,
             "comment_url": url,
@@ -519,8 +586,9 @@ def list_subreddits():
 
 @app.post("/recategorize")
 def recategorize_subreddit(subreddit: str):
-    table = f"pain_points_{subreddit.lower()}"
-    cat_table = f"categories_{subreddit.lower()}"
+    subr = str(subreddit or '').strip()
+    table = f"pain_points_{subr.lower()}"
+    cat_table = f"categories_{subr.lower()}"
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     # Load categories
@@ -528,20 +596,95 @@ def recategorize_subreddit(subreddit: str):
     categories = [row[0] for row in cursor.fetchall()]
     if not categories:
         conn.close()
-        return {"message": f"No categories found for subreddit {subreddit}."}
+        return {"message": f"No categories found for subreddit {subr}."}
     # Get all problems
     cursor.execute(f"SELECT id, problem FROM {table}")
     rows = cursor.fetchall()
     updated = 0
     for row_id, problem in rows:
-        new_cat = assign_category_openai(problem, categories, subreddit)
+        new_cat = assign_category_openai(problem, categories, subr)
         cursor.execute(f"UPDATE {table} SET category=? WHERE id=?", (new_cat, row_id))
         updated += 1
     conn.commit()
     conn.close()
-    return {"message": f"Recategorized {updated} problems in {subreddit} using 10-category set."}
+    return {"message": f"Recategorized {updated} problems in {subr} using 10-category set."}
+
+@app.get("/problems_for_labeling")
+def get_problems_for_labeling(subreddit: str = "", limit: int = 50):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    cursor = conn.cursor()
+    subr = str(subreddit or '')
+    if subr:
+        table = f"pain_points_{subr}"
+        cursor.execute(f"SELECT comment_id, problem, context, post_title, upvotes, author, comment_url FROM {table}")
+        problems = cursor.fetchall()
+        # Exclude all problems that have any label
+        cursor.execute("SELECT problem_id FROM problem_labels WHERE subreddit=?", (subr,))
+        labeled_any = set(row[0] for row in cursor.fetchall())
+        result = [dict(comment_id=row[0], problem=row[1], context=row[2], post_title=row[3], upvotes=row[4], author=row[5], comment_url=row[6])
+                  for row in problems if row[0] not in labeled_any]
+    else:
+        result = []
+    conn.close()
+    return result[:limit]
+
+@app.post("/label_problem")
+def label_problem(data: LabelRequest):
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO problem_labels (subreddit, problem_id, problem_text, context, label, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+    ''', (
+        str(data.subreddit),
+        str(data.problem_id),
+        str(data.problem_text),
+        str(data.context or ''),
+        str(data.label),
+        str(data.notes or '')
+    ))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# On scan: after scan, delete all non-'good' labeled problems for the subreddit, and do not add duplicates (by comment_id/post_id)
+def remove_non_good_and_deduplicate(conn, table, subreddit):
+    cursor = conn.cursor()
+    subr = subreddit if isinstance(subreddit, str) and subreddit is not None else ''
+    # Get all problem_ids labeled as 'bad' or 'uncertain'
+    cursor.execute("SELECT problem_id FROM problem_labels WHERE subreddit=? AND (label='bad' OR label='uncertain')", (subr,))
+    bad_ids = set(str(row[0]) for row in cursor.fetchall() if row[0] is not None)
+    if bad_ids:
+        placeholders = ','.join('?' for _ in bad_ids)
+        cursor.execute(f"DELETE FROM {table} WHERE comment_id IN ({placeholders})", tuple(bad_ids))
+        conn.commit()
+    # Do not delete unlabeled or 'good' problems
 
 # Serve index.html at the root path
 @app.get("/")
 def read_index():
-    return FileResponse("static/index.html") 
+    return FileResponse("static/index.html")
+
+@app.post("/delete_subreddit")
+def delete_subreddit(req: SubredditDeleteRequest):
+    subr = str(req.subreddit or '').strip().lower()
+    if not subr:
+        raise HTTPException(status_code=400, detail="No subreddit provided.")
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 5000")  # Wait up to 5 seconds for locks
+    cursor = conn.cursor()
+    pain_table = f"pain_points_{subr}"
+    cat_table = f"categories_{subr}"
+    # Drop pain points table if exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (pain_table,))
+    pain_exists = cursor.fetchone() is not None
+    if pain_exists:
+        cursor.execute(f"DROP TABLE IF EXISTS {pain_table}")
+    # Drop categories table if exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (cat_table,))
+    cat_exists = cursor.fetchone() is not None
+    if cat_exists:
+        cursor.execute(f"DROP TABLE IF EXISTS {cat_table}")
+    conn.commit()
+    conn.close()
+    return {"message": f"Deleted tables: {', '.join([t for t, e in [(pain_table, pain_exists), (cat_table, cat_exists)] if e]) or 'None'} for subreddit '{subr}'."} 
