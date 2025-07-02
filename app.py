@@ -4,8 +4,8 @@ import requests
 import requests.auth
 import re
 import time
-from datetime import datetime
-from fastapi import FastAPI, Request, Query, HTTPException
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -69,6 +69,13 @@ class SubredditDeleteRequest(BaseModel):
 scan_progress = {}
 scan_progress_lock = Lock()
 
+# Global deep scan progress tracker
+deep_scan_progress = {}
+deep_scan_progress_lock = Lock()
+
+# Global deep scan stop flags
+deep_scan_stop_flags = {}
+
 # Helper: Get OAuth token
 def get_token():
     auth = requests.auth.HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET)
@@ -104,21 +111,27 @@ def create_table(conn, table):
 
 # Helper: Save a matched problem to DB (deduplication via UNIQUE)
 def save_problem(conn, table, data):
-    # Get actual column order for the table
-    cursor = conn.cursor()
-    cursor.execute(f"PRAGMA table_info({table})")
-    columns = [row[1] for row in cursor.fetchall() if row[1] != 'id']  # skip autoincrement id
-    # Build values in the correct order
-    values = []
-    for col in columns:
-        values.append(data.get(col, None))
-    placeholders = ', '.join(['?'] * len(columns))
-    col_names = ', '.join(columns)
+    print(f"[DeepScan][DEBUG] Attempting to insert: {data}")
     with conn:
-        conn.execute(f'''
-            INSERT OR IGNORE INTO {table} ({col_names})
-            VALUES ({placeholders})
-        ''', tuple(values))
+        try:
+            conn.execute(f'''
+                INSERT INTO {table} (subreddit, post_title, post_id, comment_id, author, problem, context, category, upvotes, created_at, comment_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+                data['subreddit'],
+                data['post_title'],
+                data['post_id'],
+                data['comment_id'],
+                data['author'],
+                data['problem'],
+                data['context'],
+                data['category'],
+                data['upvotes'],
+                data['created_at'],
+                data['comment_url']
+            ))
+            print(f"[DeepScan] Saved problem for comment {data['comment_id']}: {data['problem']}")
+        except Exception as e:
+            print(f"[DeepScan] ERROR saving problem: {e}")
 
 # Helper: Recursively extract all comments (including nested)
 def extract_comments(comment_list, results):
@@ -345,9 +358,6 @@ def extract_and_categorize_problem_openai(text, categories=None, post_title=None
         print(f"OpenAI API error (extract & categorize): {e}")
         return None, None, None
 
-
-
-
 @app.get("/scan_progress")
 def get_scan_progress(subreddit: str):
     key = subreddit.lower()
@@ -356,6 +366,15 @@ def get_scan_progress(subreddit: str):
     if prog is None:
         return {"status": "idle"}
     return prog
+
+@app.get("/deep_scan_progress")
+def get_deep_scan_progress(subreddit: str = "", start_date: str = ""):
+    key = f"{subreddit.lower()}_{start_date}"
+    with deep_scan_progress_lock:
+        prog = deep_scan_progress.get(key, None)
+        if not prog:
+            return {"status": "idle"}
+        return prog
 
 def migrate_add_context_column():
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -717,4 +736,254 @@ def clear_labels():
     cursor.execute("DELETE FROM problem_labels")
     conn.commit()
     conn.close()
-    return {"message": "All label data cleared from problem_labels table."} 
+    return {"message": "All label data cleared from problem_labels table."}
+
+@app.post("/deep_scan")
+def deep_scan(data: dict, background_tasks: BackgroundTasks):
+    subreddit = data.get("subreddit", "").strip()
+    start_date = data.get("start_date", "").strip()
+    if not subreddit or not start_date:
+        return {"message": "Missing subreddit or start_date."}
+    # Start the background scan task (to be implemented)
+    background_tasks.add_task(deep_scan_task, subreddit, start_date)
+    return {"message": f"Started deep scan for r/{subreddit} since {start_date}."}
+
+@app.post("/stop_deep_scan")
+def stop_deep_scan(data: dict):
+    subreddit = data.get("subreddit", "").strip()
+    start_date = data.get("start_date", "").strip()
+    key = f"{subreddit.lower()}_{start_date}"
+    deep_scan_stop_flags[key] = True
+    print(f"[DeepScan] Stop requested for {key}")
+    return {"message": f"Stop requested for deep scan of r/{subreddit} since {start_date}."}
+
+def deep_scan_task(subreddit, start_date):
+    import requests, time
+    from datetime import datetime, timezone
+    import openai
+    import sqlite3
+    import os
+    BATCH_SIZE = 8
+    MODEL = "gpt-3.5-turbo"
+    DB_PATH = "reddit_pain_points.db"
+    key = f"{subreddit.lower()}_{start_date}"
+    print(f"[DeepScan] Starting deep scan for r/{subreddit} since {start_date}")
+    with deep_scan_progress_lock:
+        deep_scan_progress[key] = {"status": "scanning", "total_posts": 0, "posts_scanned": 0, "current_date": start_date}
+    # Parse start_date to timestamp
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        start_ts = int(start_dt.replace(tzinfo=timezone.utc).timestamp())
+    except Exception as e:
+        print(f"[DeepScan] Invalid start_date: {start_date}")
+        with deep_scan_progress_lock:
+            deep_scan_progress[key]["status"] = "error"
+            deep_scan_progress[key]["error"] = f"Invalid start_date: {start_date}"
+        return
+    # Reddit API credentials from .env
+    CLIENT_ID = os.getenv('REDDIT_CLIENT_ID')
+    CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
+    USER_AGENT = os.getenv('REDDIT_USER_AGENT')
+    USERNAME = os.getenv('REDDIT_USERNAME')
+    PASSWORD = os.getenv('REDDIT_PASSWORD')
+    # Get OAuth token
+    def get_token():
+        auth = requests.auth.HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET)
+        data = {
+            'grant_type': 'password',
+            'username': USERNAME,
+            'password': PASSWORD
+        }
+        headers = {'User-Agent': USER_AGENT}
+        res = requests.post('https://www.reddit.com/api/v1/access_token', auth=auth, data=data, headers=headers)
+        res.raise_for_status()
+        return res.json()['access_token']
+    token = get_token()
+    headers = {'Authorization': f'bearer {token}', 'User-Agent': USER_AGENT}
+    def fetch_posts(subreddit):
+        nonlocal token, headers
+        url = f"https://oauth.reddit.com/r/{subreddit}/new?limit=100"
+        after = None
+        total = 0
+        while True:
+            # Check stop flag
+            if deep_scan_stop_flags.get(key):
+                print(f"[DeepScan] Stop flag detected for {key}, exiting fetch_posts loop.")
+                break
+            full_url = url + (f"&after={after}" if after else "")
+            print(f"[DeepScan] Fetching posts from: {full_url}")
+            resp = requests.get(full_url, headers=headers)
+            if resp.status_code == 401:
+                print("[DeepScan] Token expired, refreshing...")
+                token = get_token()
+                headers = {'Authorization': f'bearer {token}', 'User-Agent': USER_AGENT}
+                resp = requests.get(full_url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()['data']
+            posts = data['children']
+            if not posts:
+                break
+            for post in posts:
+                post_data = post['data']
+                post_created = post_data.get('created_utc', 0)
+                # Stop if post is older than start_date
+                if post_created < start_ts:
+                    print(f"[DeepScan] Post {post_data.get('id')} is older than start_date, stopping.")
+                    return
+                yield post_data
+                total += 1
+            after = data.get('after')
+            if not after:
+                break
+            time.sleep(1)  # Rate limit
+        with deep_scan_progress_lock:
+            deep_scan_progress[key]["total_posts"] = total
+    def fetch_comments(post_id):
+        nonlocal token, headers
+        url = f"https://oauth.reddit.com/comments/{post_id}?limit=500"
+        print(f"[DeepScan] Fetching comments for post: {post_id}")
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 401:
+            print("[DeepScan] Token expired, refreshing...")
+            token = get_token()
+            headers = {'Authorization': f'bearer {token}', 'User-Agent': USER_AGENT}
+            resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        comment_listing = resp.json()
+        if len(comment_listing) < 2:
+            return []
+        all_comments = []
+        def extract_comments(comment_list, results):
+            for c in comment_list:
+                kind = c.get('kind')
+                data = c.get('data', {})
+                if kind == 't1':
+                    results.append(data)
+                    if data.get('replies') and isinstance(data['replies'], dict):
+                        extract_comments(data['replies']['data']['children'], results)
+        extract_comments(comment_listing[1]['data']['children'], all_comments)
+        return all_comments
+    def prefilter(comment):
+        body = comment.get('body', '')
+        if not body or len(body) < 30:
+            return False
+        if body.lower().startswith('bot') or 'http' in body:
+            return False
+        return True
+    def batch_extract_llm(batch, post_title):
+        openai.api_key = OPENAI_API_KEY
+        prompt = """For each Reddit comment below, extract a quoted problem statement if present, or reply NO PROBLEM.\n"""
+        for i, c in enumerate(batch):
+            prompt += f"{i+1}. {c['body']}\n"
+        prompt += "\nRespond in this format:\n1. PROBLEM: \"...\" or NO PROBLEM\n2. ..."
+        print(f"[DeepScan] Sending batch of {len(batch)} comments to OpenAI for extraction.")
+        try:
+            response = openai.ChatCompletion.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": "You are an expert at extracting real, personal problems from Reddit comments."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=256*len(batch),
+                temperature=0
+            )
+            if (
+                isinstance(response, dict)
+                and 'choices' in response
+                and isinstance(response['choices'], list)
+                and len(response['choices']) > 0
+                and 'message' in response['choices'][0]
+                and 'content' in response['choices'][0]['message']
+            ):
+                content = response['choices'][0]['message']['content']
+                print(f"[DeepScan] OpenAI response: {content[:200]}{'...' if len(content) > 200 else ''}")
+                results = content.strip().split('\n')
+                return results
+            else:
+                print(f"[DeepScan] Unexpected OpenAI response structure: {response}")
+                return ["NO PROBLEM"] * len(batch)
+        except Exception as e:
+            print(f"[DeepScan] OpenAI API error (batch extract): {e}")
+            return ["NO PROBLEM"] * len(batch)
+    conn = sqlite3.connect(DB_PATH)
+    table = f"pain_points_{subreddit.lower()}"
+    # Ensure table exists and has correct schema
+    create_table(conn, table)
+    # Print actual schema for debug
+    cursor = conn.cursor()
+    cursor.execute(f"PRAGMA table_info({table})")
+    schema = cursor.fetchall()
+    print(f"[DeepScan][DEBUG] Actual schema for {table}:")
+    for col in schema:
+        print(col)
+    n_problems = 0
+    n_posts = 0
+    try:
+        for post in fetch_posts(subreddit):
+            # Check stop flag before processing each post
+            if deep_scan_stop_flags.get(key):
+                print(f"[DeepScan] Stop flag detected for {key}, finishing current post and exiting main scan loop.")
+                # Do not break here; finish this post's comments, then exit
+                stop_after_this_post = True
+            else:
+                stop_after_this_post = False
+            post_id = post['id']
+            post_title = post.get('title', '')
+            post_date = post.get('created_utc', 0)
+            print(f"[DeepScan] Processing post: {post_id} - {post_title}")
+            comments = fetch_comments(post_id)
+            comments = [c for c in comments if prefilter(c)]
+            print(f"[DeepScan] Post {post_id}: {len(comments)} comments after prefilter.")
+            n_posts += 1
+            for i in range(0, len(comments), BATCH_SIZE):
+                batch = comments[i:i+BATCH_SIZE]
+                results = batch_extract_llm(batch, post_title)
+                for c, res in zip(batch, results):
+                    if 'PROBLEM:' in res:
+                        problem = res.split('PROBLEM:',1)[1].strip().strip('"')
+                        data = {
+                            'subreddit': subreddit,
+                            'post_title': post_title,
+                            'post_id': post_id,
+                            'comment_id': c['id'],
+                            'author': c.get('author'),
+                            'problem': problem,
+                            'context': '',  # Added context field to match schema
+                            'category': 'Uncategorized',
+                            'upvotes': c.get('score', 0),
+                            'created_at': datetime.utcfromtimestamp(c.get('created_utc', 0)).isoformat() if c.get('created_utc') else None,
+                            'comment_url': f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/_/{c['id']}"
+                        }
+                        print(f"[DeepScan] Saving problem for comment {c['id']}: {problem}")
+                        save_problem(conn, table, data)
+                        n_problems += 1
+            with deep_scan_progress_lock:
+                deep_scan_progress[key]["posts_scanned"] += 1
+                deep_scan_progress[key]["current_date"] = datetime.utcfromtimestamp(post_date).strftime("%Y-%m-%d") if post_date else ""
+            if stop_after_this_post:
+                print(f"[DeepScan] Exiting after finishing post {post_id} due to stop flag.")
+                break
+        summary_msg = f"✅ Deep scan complete: {n_problems} problems added from {n_posts} posts."
+        # Print row count in table for debug
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {table}")
+            row_count = cursor.fetchone()[0]
+            print(f"[DeepScan][DEBUG] Row count in {table} after scan: {row_count}")
+        except Exception as e:
+            print(f"[DeepScan][DEBUG] Error counting rows: {e}")
+        with deep_scan_progress_lock:
+            deep_scan_progress[key]["status"] = "done"
+            deep_scan_progress[key]["summary"] = summary_msg
+        print(summary_msg)
+    except Exception as e:
+        with deep_scan_progress_lock:
+            deep_scan_progress[key]["status"] = "error"
+            deep_scan_progress[key]["error"] = str(e)
+        print(f"[DeepScan] ERROR: {e}")
+    finally:
+        conn.commit()
+        conn.close()
+        # Clean up stop flag
+        if key in deep_scan_stop_flags:
+            del deep_scan_stop_flags[key] 
