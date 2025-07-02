@@ -282,8 +282,8 @@ def assign_category_openai(problem, categories, subreddit):
 def extract_and_categorize_problem_openai(text, categories=None, post_title=None):
     """
     Uses OpenAI to extract a quoted problem statement and assign a category in a single call.
-    The extracted problem should include any necessary context inside the quoted text.
-    Returns (problem, context, category) or (None, None, None) if no problem is found.
+    The extracted problem must include any necessary context inside the quoted text.
+    Returns (problem, context, category) or (None, None, None) if no valid problem is found.
     """
     if not openai or not OPENAI_API_KEY or not text.strip():
         return None, None, None
@@ -293,29 +293,31 @@ def extract_and_categorize_problem_openai(text, categories=None, post_title=None
         cat_list = ', '.join(categories)
         prompt = (
             f"{context_intro}Comment or post body: {text}\n\n"
-            "Does the above text contain a clear, personal problem or pain point, written in first-person? "
-            "Ignore general advice, facts, or opinions that do not describe the user's own problem. "
-            "If yes, quote exactly the full sentence or 2–3 consecutive sentences that best describe the problem, "
-            "including any context needed, all inside PROBLEM. Do not create a separate CONTEXT field. "
+            "Does the above text contain a clear, personal problem, pain point, or challenge directly related to the topic? "
+            "Only accept a real need, pain, struggle, question, or thing the user does not know how to solve. "
+            "Reject general advice, replies to others, vague statements, or statements that only describe goals or achievements without mentioning any difficulty, pain, or obstacle. "
+            "Reject text that is too short to understand without extra context. "
+            "If valid, quote exactly the full sentence or 2–3 consecutive sentences that clearly show the problem, including any context needed, all inside PROBLEM. "
             f"Assign it to one of these categories: {cat_list}.\n"
             "Reply only in this format:\nPROBLEM: \"quoted problem with context\"\nCATEGORY: category_name\n"
-            "If there is no clear, personal problem, reply 'NO PROBLEM'."
+            "If no valid personal problem exists, reply 'NO PROBLEM'."
         )
     else:
         prompt = (
             f"{context_intro}Comment or post body: {text}\n\n"
-            "Does the above text contain a clear, personal problem or pain point, written in first-person? "
-            "Ignore general advice, facts, or opinions that do not describe the user's own problem. "
-            "If yes, quote exactly the full sentence or 2–3 consecutive sentences that best describe the problem, "
-            "including any context needed, all inside PROBLEM. Do not create a separate CONTEXT field. "
+            "Does the above text contain a clear, personal problem, pain point, or challenge directly related to the topic? "
+            "Only accept a real need, pain, struggle, question, or thing the user does not know how to solve. "
+            "Reject general advice, replies to others, vague statements, or statements that only describe goals or achievements without mentioning any difficulty, pain, or obstacle. "
+            "Reject text that is too short to understand without extra context. "
+            "If valid, quote exactly the full sentence or 2–3 consecutive sentences that clearly show the problem, including any context needed, all inside PROBLEM. "
             "Reply only in this format:\nPROBLEM: \"quoted problem with context\"\n"
-            "If there is no clear, personal problem, reply 'NO PROBLEM'."
+            "If no valid personal problem exists, reply 'NO PROBLEM'."
         )
     try:
         response = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are an expert at detecting real, personal problems in online discussions and only extracting genuine user-expressed complaints or challenges."},
+                {"role": "system", "content": "You are an expert at detecting clear, personal problems in online discussions. Only extract genuine user-expressed needs, struggles, or unanswered questions. Never accept goals or general statements alone."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=256,
@@ -342,6 +344,8 @@ def extract_and_categorize_problem_openai(text, categories=None, post_title=None
     except Exception as e:
         print(f"OpenAI API error (extract & categorize): {e}")
         return None, None, None
+
+
 
 
 @app.get("/scan_progress")
@@ -372,7 +376,7 @@ def migrate_add_context_column():
     for table in tables:
         cursor.execute(f"PRAGMA table_info({table})")
         columns = [row[1] for row in cursor.fetchall()]
-        print(f"Schema for {table}: {columns}")
+        # print(f"Schema for {table}: {columns}")  # Debug: schema output (now disabled)
         if 'context' not in columns:
             raise RuntimeError(f"Table {table} is missing 'context' column after migration!")
     conn.close()
@@ -444,6 +448,11 @@ def scan_subreddit(req: ScanRequest):
                 post_data = post['data']
                 post_id = post_data['id']
                 post_title = post_data.get('title', '')
+                # --- Skip if post already scanned ---
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT 1 FROM {table} WHERE comment_id=?", (post_id,))
+                if cursor.fetchone():
+                    continue
                 # --- Scan the original post body ---
                 post_body = post_data.get('selftext', '')
                 if post_body.strip():
@@ -484,8 +493,12 @@ def scan_subreddit(req: ScanRequest):
                 extract_comments(comment_listing[1]['data']['children'], all_comments)
                 for c in all_comments:
                     body = c.get('body', '')
+                    comment_id = c.get('id')
                     if not body.strip():
                         continue
+                    cursor.execute(f"SELECT 1 FROM {table} WHERE comment_id=?", (comment_id,))
+                    if cursor.fetchone():
+                        continue  # Already scanned
                     if not categories and len(sample_problems) < sample_limit:
                         problem, context, _ = extract_and_categorize_problem_openai(body, None, post_title)
                         if problem:
@@ -502,16 +515,17 @@ def scan_subreddit(req: ScanRequest):
                                 'subreddit': subreddit,
                                 'post_title': post_title,
                                 'post_id': post_id,
-                                'comment_id': c.get('id'),
+                                'comment_id': comment_id,
                                 'author': c.get('author'),
                                 'problem': problem,
                                 'context': context,
                                 'category': category,
                                 'upvotes': c.get('score', 0),
                                 'created_at': datetime.utcfromtimestamp(c.get('created_utc', 0)).isoformat() if c.get('created_utc') else None,
-                                'comment_url': make_comment_url(subreddit, post_id, c.get('id'))
+                                'comment_url': make_comment_url(subreddit, post_id, comment_id)
                             }
                             save_problem(conn, table, data)
+                    
                 time.sleep(1)
             if not after:
                 break
@@ -538,14 +552,20 @@ def get_summary(subreddit: str = Query(None)):
         table_name = f"pain_points_{subr}"
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         if cursor.fetchone():
-            cursor.execute(f"SELECT category, problem, context, post_title, upvotes, author, comment_url, subreddit FROM {table_name}")
+            # Join with problem_labels to get label for each problem
+            cursor.execute(f'''
+                SELECT p.category, p.problem, p.context, p.post_title, p.upvotes, p.author, p.comment_url, p.subreddit, l.label
+                FROM {table_name} p
+                LEFT JOIN problem_labels l ON p.comment_id = l.problem_id AND l.subreddit = ?
+                WHERE l.label IS NULL OR l.label != 'bad'
+            ''', (subr,))
             all_rows.extend(cursor.fetchall())
     else:
         # No subreddit selected, return empty list
         conn.close()
         return []
     summary = {}
-    for cat, problem, context, post_title, upvotes, author, url, subreddit in all_rows:
+    for cat, problem, context, post_title, upvotes, author, url, subreddit, label in all_rows:
         if not cat:
             cat = 'Uncategorized'
         if cat not in summary:
@@ -558,7 +578,8 @@ def get_summary(subreddit: str = Query(None)):
             "upvotes": upvotes,
             "author": author,
             "comment_url": url,
-            "subreddit": subreddit
+            "subreddit": subreddit,
+            "label": label
         })
     # Sort categories by total_upvotes, then by number of problems
     sorted_summary = sorted(
@@ -687,4 +708,13 @@ def delete_subreddit(req: SubredditDeleteRequest):
         cursor.execute(f"DROP TABLE IF EXISTS {cat_table}")
     conn.commit()
     conn.close()
-    return {"message": f"Deleted tables: {', '.join([t for t, e in [(pain_table, pain_exists), (cat_table, cat_exists)] if e]) or 'None'} for subreddit '{subr}'."} 
+    return {"message": f"Deleted tables: {', '.join([t for t, e in [(pain_table, pain_exists), (cat_table, cat_exists)] if e]) or 'None'} for subreddit '{subr}'."}
+
+@app.post("/clear_labels")
+def clear_labels():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM problem_labels")
+    conn.commit()
+    conn.close()
+    return {"message": "All label data cleared from problem_labels table."} 

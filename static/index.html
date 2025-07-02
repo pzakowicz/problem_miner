@@ -5,14 +5,90 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reddit Pain Point Miner</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 2em; }
-        .category { margin: 1em 0; border: 1px solid #ccc; border-radius: 6px; }
-        .category-header { background: #f0f0f0; padding: 0.5em; cursor: pointer; font-weight: bold; }
-        .problems { display: none; padding: 0.5em 1em; }
-        .problem { margin-bottom: 0.5em; border-bottom: 1px solid #eee; padding-bottom: 0.5em; }
+        body { font-family: Arial, sans-serif; background: #f7f7f7; margin: 2em; }
+        .category { margin-bottom: 2em; }
+        .category-header { font-size: 1.2em; font-weight: bold; margin-bottom: 0.5em; cursor: pointer; background: #eaeaea; padding: 8px 12px; border-radius: 6px; }
+        .problems { margin-top: 0.5em; }
+        .problem-card {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+            padding: 20px 24px 16px 24px;
+            margin-bottom: 18px;
+            transition: box-shadow 0.2s;
+            border: 1px solid #ececec;
+        }
+        .problem-card:hover {
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        }
+        .problem-main {
+            font-size: 1.15em;
+            font-weight: bold;
+            color: #222;
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+        .problem-title {
+            font-size: 1em;
+            color: #555;
+            font-weight: 500;
+            margin-bottom: 6px;
+        }
+        .problem-context {
+            color: #444;
+            font-size: 0.98em;
+            margin-bottom: 10px;
+        }
+        .problem-meta {
+            font-size: 0.93em;
+            color: #888;
+            margin-top: 6px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5em;
+            align-items: center;
+        }
+        .problem-meta a { color: #3b6cb7; text-decoration: none; }
+        .problem-meta a:hover { text-decoration: underline; }
         .toast { background: #4caf50; color: white; padding: 1em; border-radius: 5px; position: fixed; top: 1em; right: 1em; display: none; }
         .input-row { margin-bottom: 1em; }
-        .input-row input, .input-row button { font-size: 1em; padding: 0.5em; }
+        .input-row input, .input-row button, .input-row select {
+            font-size: 1em;
+            padding: 0.6em 1.4em;
+            border-radius: 2em;
+            border: 1.5px solid #e0e0e0;
+            background: #fff;
+            color: #222;
+            outline: none;
+            transition: border 0.2s, box-shadow 0.2s;
+            height: 2.5em;
+            box-sizing: border-box;
+            margin-right: 0.5em;
+        }
+        .input-row button {
+            cursor: pointer;
+            font-weight: 500;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5em;
+        }
+        .input-row button:active, .input-row button:focus {
+            border-color: #bdbdbd;
+            box-shadow: 0 0 0 2px #e0e0e0;
+        }
+        .input-row button:hover {
+            background: #f7f7f7;
+        }
+        .input-row select {
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            background: #fff url('data:image/svg+xml;utf8,<svg fill="%23666" height="16" viewBox="0 0 24 24" width="16" xmlns="http://www.w3.org/2000/svg"><path d="M7 10l5 5 5-5z"/></svg>') no-repeat right 1em center/1em 1em;
+            padding-right: 2.5em;
+        }
+        .input-row input[type=text] {
+            min-width: 220px;
+        }
         .spinner { display: none; margin-left: 1em; vertical-align: middle; }
         .spinner div {
             width: 18px; height: 18px; border: 3px solid #ccc; border-top: 3px solid #4caf50; border-radius: 50%; animation: spin 1s linear infinite;
@@ -22,27 +98,36 @@
 </head>
 <body>
     <h1>Reddit Pain Point Miner</h1>
-    <div class="input-row">
-        <input id="subreddit" type="text" placeholder="Enter subreddit (e.g. HybridAthlete)" />
-        <select id="numPosts" style="margin-left:0.5em;">
-            <option value="5">5 posts</option>
-            <option value="10" selected>10 posts</option>
-            <option value="20">20 posts</option>
-            <option value="50">50 posts</option>
-            <option value="100">100 posts</option>
-        </select>
-        <button id="scanBtn" onclick="runScan()">Scan Subreddit</button>
-        <span class="spinner" id="spinner"><div></div></span>
-        <span id="progressMsg" style="margin-left:1em;color:#555;"></span>
-    </div>
-    <div class="input-row">
-        <select id="subredditSelect" onchange="onSubredditSelect()">
-            <option value="">-- Select subreddit --</option>
-        </select>
-        <button id="clearBtn" onclick="clearData()">Clear Data</button>
+    <div style="display:flex; flex-direction:column; gap:0.5em; max-width:900px;">
+        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
+            <input id="subreddit" type="text" placeholder="Enter subreddit (e.g. HybridAthlete)" />
+            <select id="numPosts">
+                <option value="5">5 posts</option>
+                <option value="10" selected>10 posts</option>
+                <option value="20">20 posts</option>
+                <option value="50">50 posts</option>
+                <option value="100">100 posts</option>
+            </select>
+            <button id="scanBtn" onclick="runScan()">Scan Subreddit</button>
+            <span class="spinner" id="spinner"><div></div></span>
+            <span id="progressMsg" style="margin-left:1em;color:#555;"></span>
+        </div>
+        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
+            <select id="subredditSelect" onchange="onSubredditSelect()">
+                <option value="">-- Select subreddit --</option>
+            </select>
+            <button id="clearBtn" onclick="clearData()">Clear Data</button>
+            <button id="deleteSubBtn" onclick="deleteSubredditData()">Delete Subreddit Data</button>
+            <button id="clearLabelsBtn" onclick="clearLabels()">Clear Labels</button>
+        </div>
+        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
+            <button id="reviewTabBtn" onclick="showReviewTab()">Review & Label Problems</button>
+            <button id="summaryTabBtn" onclick="showSummaryTab()" style="display:none;">Back to Summary</button>
+        </div>
     </div>
     <div id="toast" class="toast"></div>
-    <div id="summary"></div>
+    <div id="summary" style="display:block;"></div>
+    <div id="reviewSection" style="display:none;"></div>
     <script>
         let currentSubreddit = '';
         let progressInterval = null;
@@ -95,11 +180,7 @@
                     if (lastProgressStatus === 'scanning') {
                         progressMsg.textContent = 'Finalizing...';
                     } else {
-                        progressMsg.textContent = '';
-                        spinner.style.display = 'none';
-                        scanBtn.disabled = false;
-                        clearInterval(progressInterval);
-                        progressInterval = null;
+                        progressMsg.textContent = 'Waiting for scan to start...';
                     }
                 }
             } catch (e) {
@@ -122,6 +203,7 @@
             if (!subreddit) return;
             const res = await fetch(`/summary?subreddit=${encodeURIComponent(subreddit)}`);
             const summary = await res.json();
+            console.log('Summary data:', summary);
             summary.forEach((catObj, idx) => {
                 const catDiv = document.createElement('div');
                 catDiv.className = 'category';
@@ -143,12 +225,41 @@
                 problemsDiv.className = 'problems';
                 catObj.problems.forEach(prob => {
                     const probDiv = document.createElement('div');
-                    probDiv.className = 'problem';
-                    probDiv.innerHTML = `<b>Comment:</b> ${prob.problem}<br>
-                        <b>Upvotes:</b> ${prob.upvotes} | <b>Author:</b> ${prob.author} | <a href="${prob.comment_url}" target="_blank">View Comment</a> <span style="color:#888">[${prob.subreddit}]</span>`;
+                    probDiv.className = 'problem-card';
+                    if (prob.label === 'good') {
+                        probDiv.style.background = '#f4fbf4'; // subtle green-gray blend
+                        probDiv.style.border = '2px solid #4caf50';
+                    }
+                    const safeTitle = prob.post_title ? prob.post_title : '';
+                    const safeProblem = prob.problem ? prob.problem : '';
+                    const safeContext = prob.context ? prob.context : '';
+                    const safeUpvotes = prob.upvotes !== undefined && prob.upvotes !== null ? prob.upvotes : '';
+                    const safeAuthor = prob.author ? prob.author : '';
+                    const safeUrl = prob.comment_url ? prob.comment_url : '#';
+                    const safeSubreddit = prob.subreddit ? prob.subreddit : '';
+                    let html = '';
+                    if (prob.label === 'good') {
+                        html += `<span title='Labeled as good' style='color:#388e3c;font-size:1.3em;float:right;'>&#10003;</span>`;
+                    }
+                    html += `<div class='problem-main'>${safeProblem}</div>`;
+                    if (safeTitle) {
+                        html += `<div class='problem-title'>${safeTitle}</div>`;
+                    }
+                    if (safeContext && safeContext !== safeProblem) {
+                        html += `<div class='problem-context'>${safeContext}</div>`;
+                    }
+                    html += `<div class='problem-meta'>`;
+                    html += `<span><b>Upvotes:</b> ${safeUpvotes}</span>`;
+                    html += `<span><b>Author:</b> ${safeAuthor}</span>`;
+                    html += `<span><a href="${safeUrl}" target="_blank">View Comment</a></span>`;
+                    html += `<span>[${safeSubreddit}]</span>`;
+                    html += `</div>`;
+                    probDiv.innerHTML = html;
                     problemsDiv.appendChild(probDiv);
                 });
                 catDiv.appendChild(problemsDiv);
+                // Collapse problems by default
+                problemsDiv.style.display = 'none';
                 container.appendChild(catDiv);
             });
         }
@@ -179,6 +290,108 @@
             toast.textContent = msg;
             toast.style.display = 'block';
             setTimeout(() => { toast.style.display = 'none'; }, 3000);
+        }
+        function showReviewTab() {
+            document.getElementById('summary').style.display = 'none';
+            document.getElementById('reviewSection').style.display = 'block';
+            document.getElementById('reviewTabBtn').style.display = 'none';
+            document.getElementById('summaryTabBtn').style.display = 'inline-block';
+            loadProblemsForLabeling();
+        }
+        function showSummaryTab() {
+            document.getElementById('summary').style.display = 'block';
+            document.getElementById('reviewSection').style.display = 'none';
+            document.getElementById('reviewTabBtn').style.display = 'inline-block';
+            document.getElementById('summaryTabBtn').style.display = 'none';
+            loadSummary(currentSubreddit);
+        }
+        async function loadProblemsForLabeling() {
+            const subreddit = currentSubreddit;
+            const container = document.getElementById('reviewSection');
+            container.innerHTML = '<h2>Review & Label Problems</h2>';
+            if (!subreddit) {
+                container.innerHTML += '<div>Please select a subreddit first.</div>';
+                return;
+            }
+            const res = await fetch(`/problems_for_labeling?subreddit=${encodeURIComponent(subreddit)}`);
+            const problems = await res.json();
+            if (!problems.length) {
+                container.innerHTML += '<div>No problems to review for this subreddit.</div>';
+                return;
+            }
+            problems.forEach(prob => {
+                const card = document.createElement('div');
+                card.className = 'problem-card';
+                let html = `<div class='problem-main'>${prob.problem}</div>`;
+                if (prob.post_title) html += `<div class='problem-title'>${prob.post_title}</div>`;
+                if (prob.context && prob.context !== prob.problem) html += `<div class='problem-context'>${prob.context}</div>`;
+                html += `<div class='problem-meta'>`;
+                html += `<span><a href="${prob.comment_url}" target="_blank">View Comment</a></span>`;
+                html += `</div>`;
+                html += `<div style='margin-top:10px;'>
+                    <label><input type='radio' name='label_${prob.comment_id}' value='good'> Good Problem</label>
+                    <label style='margin-left:1em;'><input type='radio' name='label_${prob.comment_id}' value='bad'> Not a Problem</label>
+                    <label style='margin-left:1em;'><input type='radio' name='label_${prob.comment_id}' value='uncertain'> Uncertain</label>
+                </div>`;
+                card.innerHTML = html;
+                // Add event listeners for radio buttons
+                card.querySelectorAll('input[type=radio]').forEach(radio => {
+                    radio.addEventListener('change', async (e) => {
+                        const label = e.target.value;
+                        // Ensure all required fields are present and strings
+                        const payload = {
+                            subreddit: String(subreddit),
+                            problem_id: String(prob.comment_id || prob.post_id || ''),
+                            problem_text: String(prob.problem || ''),
+                            context: String(prob.context || ''),
+                            label: String(label),
+                            notes: ''
+                        };
+                        try {
+                            const resp = await fetch('/label_problem', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(payload)
+                            });
+                            if (resp.ok) {
+                                card.style.opacity = 0.5;
+                                showToast('Label saved!');
+                            } else {
+                                showToast('Error saving label.');
+                            }
+                        } catch (err) {
+                            showToast('Error saving label.');
+                        }
+                    });
+                });
+                container.appendChild(card);
+            });
+            // Add refresh button
+            const refreshBtn = document.createElement('button');
+            refreshBtn.textContent = 'Refresh Review Set';
+            refreshBtn.onclick = loadProblemsForLabeling;
+            container.appendChild(refreshBtn);
+        }
+        async function deleteSubredditData() {
+            const select = document.getElementById('subredditSelect');
+            const subreddit = select.value;
+            if (!subreddit) { showToast('Select a subreddit to delete.'); return; }
+            if (!confirm(`Are you sure you want to delete all data for '${subreddit}'? This cannot be undone.`)) return;
+            const res = await fetch('/delete_subreddit', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subreddit })
+            });
+            const data = await res.json();
+            showToast(data.message || 'Deleted.');
+            await loadSubreddits();
+            clearData();
+        }
+        async function clearLabels() {
+            if (!confirm('Are you sure you want to clear ALL label data? This cannot be undone.')) return;
+            const res = await fetch('/clear_labels', { method: 'POST' });
+            const data = await res.json();
+            showToast(data.message || 'Label data cleared.');
         }
         // Initial load
         loadSubreddits();
