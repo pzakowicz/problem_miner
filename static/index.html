@@ -94,44 +94,108 @@
             width: 18px; height: 18px; border: 3px solid #ccc; border-top: 3px solid #4caf50; border-radius: 50%; animation: spin 1s linear infinite;
         }
         @keyframes spin { 100% { transform: rotate(360deg); } }
+        .tab-row { margin-bottom: 1em; }
+        .tab-btn {
+            padding: 0.5em 1em;
+            border: none;
+            background: none;
+            font: inherit;
+            color: inherit;
+            cursor: pointer;
+            outline: inherit;
+        }
+        .tab-btn.active { font-weight: bold; }
+        .tab-content { display: none; }
     </style>
 </head>
 <body>
     <h1>Reddit Pain Point Miner</h1>
-    <div style="display:flex; flex-direction:column; gap:0.5em; max-width:900px;">
-        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
-            <input id="subreddit" type="text" placeholder="Enter subreddit (e.g. HybridAthlete)" />
-            <select id="numPosts">
-                <option value="5">5 posts</option>
-                <option value="10" selected>10 posts</option>
-                <option value="20">20 posts</option>
-                <option value="50">50 posts</option>
-                <option value="100">100 posts</option>
-            </select>
-            <button id="scanBtn" onclick="runScan()">Scan Subreddit</button>
-            <span class="spinner" id="spinner"><div></div></span>
-            <span id="progressMsg" style="margin-left:1em;color:#555;"></span>
-        </div>
-        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
-            <select id="subredditSelect" onchange="onSubredditSelect()">
-                <option value="">-- Select subreddit --</option>
-            </select>
-            <button id="clearBtn" onclick="clearData()">Clear Data</button>
-            <button id="deleteSubBtn" onclick="deleteSubredditData()">Delete Subreddit Data</button>
-            <button id="clearLabelsBtn" onclick="clearLabels()">Clear Labels</button>
-        </div>
-        <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
-            <button id="reviewTabBtn" onclick="showReviewTab()">Review & Label Problems</button>
+    <div class="tab-row" style="margin-bottom:1em;">
+        <button class="tab-btn" id="tabSummaryBtn" onclick="showTab('summary')">Summary</button>
+        <button class="tab-btn" id="tabLabelBtn" onclick="showTab('label')">Label</button>
+        <button class="tab-btn" id="tabExportBtn" onclick="showTab('export')">Export</button>
+    </div>
+    <!-- Summary Tab Content -->
+    <div id="tabSummary" class="tab-content" style="display:block;">
+        <div style="display:flex; flex-direction:column; gap:0.5em; max-width:900px;">
+            <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
+                <input id="subreddit" placeholder="Enter subreddit (e.g. Hyt)" style="min-width:200px;">
+                <select id="numPosts">
+                    <option value="10">10 posts</option>
+                    <option value="25">25 posts</option>
+                    <option value="50">50 posts</option>
+                    <option value="100">100 posts</option>
+                </select>
+                <button id="scanBtn" onclick="runScan()">Scan Subreddit</button>
+                <input id="scanStartDate" type="date" style="min-width:120px;">
+                <button id="deepScanBtn" onclick="runDeepScan()">Deep Scan</button>
+            </div>
+            <div class="input-row" style="display:flex; align-items:center; gap:0.5em;">
+                <select id="subredditSelect" onchange="onSubredditSelect()">
+                    <option value="">-- Select subreddit --</option>
+                </select>
+                <button id="clearBtn" onclick="clearData()">Clear Data</button>
+                <button id="deleteSubBtn" onclick="deleteSubredditData()">Delete Subreddit Data</button>
+                <button id="clearLabelsBtn" onclick="clearLabels()">Clear Labels</button>
+                <button id="recategorizeBtn" onclick="recategorizeSubreddit()">Recategorize</button>
+            </div>
             <button id="summaryTabBtn" onclick="showSummaryTab()" style="display:none;">Back to Summary</button>
+            <div id="summary" style="display:block;"></div>
         </div>
     </div>
-    <div id="toast" class="toast"></div>
-    <div id="summary" style="display:block;"></div>
-    <div id="reviewSection" style="display:none;"></div>
+    <!-- Label Tab Content -->
+    <div id="tabLabel" class="tab-content" style="display:none;">
+        <div id="reviewSection" style="display:none;"></div>
+    </div>
+    <!-- Export Tab Content -->
+    <div id="tabExport" class="tab-content" style="display:none;">
+        <div style="display:flex; flex-direction:column; gap:0.5em; max-width:900px;">
+            <h3>Export Reddit Data</h3>
+            <form id="exportForm" onsubmit="return exportRedditData(event)">
+                <input id="exportSubreddit" placeholder="Enter subreddit" />
+                <label for="exportStartDate" style="margin-left:1em;">From:
+                    <input type="date" id="exportStartDate" />
+                </label>
+                <label for="exportEndDate" style="margin-left:1em;">To:
+                    <input type="date" id="exportEndDate" />
+                </label>
+                <input type="number" id="exportLimit" placeholder="Limit (default 100)" style="margin-left:1em;" />
+                <button id="exportBtn" type="submit">Export Data</button>
+            </form>
+            <div id="exportResult"></div>
+        </div>
+    </div>
+    <!-- Export Progress Modal -->
+    <div id="exportModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.3); z-index:10000; align-items:center; justify-content:center;">
+        <div style="background:white; padding:2em 2.5em; border-radius:10px; box-shadow:0 2px 16px #0002; min-width:320px; text-align:center;">
+            <div class="spinner-border" role="status" style="width:2.5rem; height:2.5rem; margin-bottom:1em;"></div>
+            <div id="exportProgressText" style="font-size:1.1em; margin-bottom:0.5em;">Exporting...</div>
+            <div style="background:#eee; border-radius:6px; height:18px; margin-bottom:0.5em;">
+                <div id="exportProgressBar" style="background:#007bff; height:100%; width:0%; border-radius:6px;"></div>
+            </div>
+            <div id="exportProgressCount" style="font-size:0.95em; color:#444;"></div>
+            <div id="exportDownloadSection" style="margin-top:1em; display:none;"></div>
+            <button id="exportCloseBtn" onclick="closeExportModal()" style="margin-top:1em; display:none;">Close</button>
+        </div>
+    </div>
+    <!-- Recategorization Progress Modal -->
+    <div id="recategorizeModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.3); z-index:10000; align-items:center; justify-content:center;">
+        <div style="background:white; padding:2em 2.5em; border-radius:10px; box-shadow:0 2px 16px #0002; min-width:320px; text-align:center;">
+            <div class="spinner-border" role="status" style="width:2.5rem; height:2.5rem; margin-bottom:1em;"></div>
+            <div id="recategorizeProgressText" style="font-size:1.1em; margin-bottom:0.5em;">Recategorizing...</div>
+            <div style="background:#eee; border-radius:6px; height:16px; width:100%; margin-bottom:0.5em;">
+                <div id="recategorizeProgressBar" style="background:#4caf50; height:100%; width:0%; border-radius:6px;"></div>
+            </div>
+        </div>
+    </div>
     <script>
         let currentSubreddit = '';
         let progressInterval = null;
         let lastProgressStatus = '';
+        let deepScanProgressInterval = null;
+        let recategorizePoller = null;
+        let exportPollInterval = null;
+        let exportSession = null;
         async function runScan() {
             const subreddit = document.getElementById('subreddit').value.trim();
             const numPosts = parseInt(document.getElementById('numPosts').value, 10);
@@ -393,6 +457,267 @@
             const data = await res.json();
             showToast(data.message || 'Label data cleared.');
         }
+        async function runDeepScan() {
+            const subreddit = document.getElementById('subreddit').value.trim();
+            const startDate = document.getElementById('scanStartDate').value;
+            const deepScanBtn = document.getElementById('deepScanBtn');
+            const spinner = document.getElementById('spinner');
+            const progressMsg = document.getElementById('progressMsg');
+            if (!subreddit) { alert('Please enter a subreddit.'); return; }
+            if (!startDate) { alert('Please select a start date.'); return; }
+            deepScanBtn.disabled = true;
+            spinner.style.display = 'inline-block';
+            progressMsg.textContent = '';
+            showToast('Starting deep scan...');
+            // Start polling progress
+            if (deepScanProgressInterval) clearInterval(deepScanProgressInterval);
+            deepScanProgressInterval = setInterval(() => pollDeepScanProgress(subreddit, startDate), 1000);
+            await fetch('/deep_scan', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ subreddit, start_date: startDate })
+            })
+            .then(r => r.json())
+            .then(data => showToast(data.message || 'Deep scan started!'))
+            .catch(() => showToast('Error running deep scan.'));
+        }
+        async function pollDeepScanProgress(subreddit, startDate) {
+            const progressMsg = document.getElementById('progressMsg');
+            const spinner = document.getElementById('spinner');
+            const deepScanBtn = document.getElementById('deepScanBtn');
+            try {
+                const res = await fetch(`/deep_scan_progress?subreddit=${encodeURIComponent(subreddit)}&start_date=${encodeURIComponent(startDate)}`);
+                const prog = await res.json();
+                // Calculate days left
+                let daysLeft = '';
+                if (prog.current_date && startDate) {
+                    try {
+                        const start = new Date(startDate);
+                        const curr = new Date(prog.current_date);
+                        const diff = Math.max(0, Math.ceil((curr - start) / (1000*60*60*24)));
+                        daysLeft = diff > 0 ? `${diff} day${diff !== 1 ? 's' : ''} scanned` : '0 days';
+                    } catch {}
+                }
+                if (prog.status === 'scanning') {
+                    spinner.style.display = 'inline-block';
+                    deepScanBtn.disabled = true;
+                    progressMsg.innerHTML = `<b>Deep Scan:</b> <span style='color:#333;'>${startDate} → today</span> &nbsp;|&nbsp; <b>Current date:</b> <span style='color:#333;'>${prog.current_date || ''}</span> &nbsp;|&nbsp; <b>Days scanned:</b> <span style='color:#333;'>${daysLeft}</span> &nbsp;|&nbsp; <b>Posts scanned:</b> <span style='color:#333;'>${prog.posts_scanned || 0}</span>`;
+                } else if (prog.status === 'done') {
+                    spinner.style.display = 'none';
+                    deepScanBtn.disabled = false;
+                    if (prog.summary) {
+                        progressMsg.innerHTML = `<b>${prog.summary}</b>`;
+                    } else {
+                        progressMsg.innerHTML = `<b>Deep Scan complete:</b> <span style='color:#333;'>${prog.posts_scanned || 0} posts scanned.</span>`;
+                    }
+                    clearInterval(deepScanProgressInterval);
+                    deepScanProgressInterval = null;
+                } else if (prog.status === 'error') {
+                    spinner.style.display = 'none';
+                    deepScanBtn.disabled = false;
+                    progressMsg.innerHTML = `<b>Error during deep scan:</b> <span style='color:#c00;'>${prog.error || ''}</span>`;
+                    clearInterval(deepScanProgressInterval);
+                    deepScanProgressInterval = null;
+                } else {
+                    spinner.style.display = 'none';
+                    deepScanBtn.disabled = false;
+                    progressMsg.innerHTML = '';
+                }
+            } catch (e) {
+                spinner.style.display = 'none';
+                deepScanBtn.disabled = false;
+                progressMsg.innerHTML = '';
+                clearInterval(deepScanProgressInterval);
+                deepScanProgressInterval = null;
+            }
+        }
+        async function recategorizeSubreddit() {
+            const btn = document.getElementById('recategorizeBtn');
+            btn.disabled = true;
+            const origText = btn.innerHTML;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Recategorizing...';
+            const subreddit = getCurrentSubreddit();
+            let ok = false;
+            let msg = '';
+            showRecategorizeModal();
+            startRecategorizeProgressPoll(subreddit);
+            try {
+                const resp = await fetch('/recategorize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ subreddit })
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    ok = true;
+                    msg = data.message || 'Recategorization complete!';
+                } else {
+                    msg = data.error || data.message || 'Recategorization failed.';
+                }
+            } catch (e) {
+                msg = 'Network or server error.';
+            }
+            btn.disabled = false;
+            btn.innerHTML = origText;
+            stopRecategorizeProgressPoll();
+            hideRecategorizeModal();
+            showToast(msg, ok ? 'success' : 'error');
+            if (ok) refreshSummary();
+        }
+        function showRecategorizeModal() {
+            document.getElementById('recategorizeModal').style.display = 'flex';
+            updateRecategorizeProgress({status:'running', total:0, done:0, message:'Starting...'});
+        }
+        function hideRecategorizeModal() {
+            document.getElementById('recategorizeModal').style.display = 'none';
+        }
+        function updateRecategorizeProgress(prog) {
+            const text = document.getElementById('recategorizeProgressText');
+            const bar = document.getElementById('recategorizeProgressBar');
+            if (prog.status === 'running') {
+                text.textContent = `Recategorized ${prog.done} of ${prog.total} problems...`;
+                let pct = prog.total ? Math.round(100 * prog.done / prog.total) : 0;
+                bar.style.width = pct + '%';
+            } else if (prog.status === 'done') {
+                text.textContent = prog.message || 'Recategorization complete!';
+                bar.style.width = '100%';
+            } else if (prog.status === 'error') {
+                text.textContent = 'Error: ' + (prog.message || 'Unknown error');
+                bar.style.width = '0%';
+            } else {
+                text.textContent = 'Idle.';
+                bar.style.width = '0%';
+            }
+        }
+        function startRecategorizeProgressPoll(subreddit) {
+            stopRecategorizeProgressPoll();
+            recategorizePoller = setInterval(async () => {
+                try {
+                    const resp = await fetch(`/recategorize_progress?subreddit=${encodeURIComponent(subreddit)}`);
+                    const prog = await resp.json();
+                    updateRecategorizeProgress(prog);
+                    if (prog.status === 'done' || prog.status === 'error') {
+                        stopRecategorizeProgressPoll();
+                        setTimeout(hideRecategorizeModal, 1200);
+                    }
+                } catch {}
+            }, 1000);
+        }
+        function stopRecategorizeProgressPoll() {
+            if (recategorizePoller) {
+                clearInterval(recategorizePoller);
+                recategorizePoller = null;
+            }
+        }
+        function showTab(tab) {
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+            // Remove active class from all tab buttons
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            // Show the selected tab content
+            document.getElementById('tab' + capitalize(tab)).style.display = 'block';
+            // Set the active tab button
+            document.getElementById('tab' + capitalize(tab) + 'Btn').classList.add('active');
+        }
+        function capitalize(str) {
+            return str.charAt(0).toUpperCase() + str.slice(1);
+        }
+        function setExportDefaultDates() {
+            const today = new Date();
+            const yyyy = today.getFullYear();
+            const mm = String(today.getMonth() + 1).padStart(2, '0');
+            const dd = String(today.getDate()).padStart(2, '0');
+            document.getElementById('exportEndDate').value = `${yyyy}-${mm}-${dd}`;
+            document.getElementById('exportStartDate').value = `${yyyy}-${mm}-${dd}`;
+        }
+        function populateExportSubreddits() {
+            fetch('/subreddits').then(r => r.json()).then(list => {
+                const sel = document.getElementById('exportSubredditSelect');
+                sel.innerHTML = '<option value="">-- Select subreddit --</option>' + list.map(s => `<option value="${s}">${s}</option>`).join('');
+            });
+        }
+        async function exportRedditData(event) {
+            event.preventDefault();
+            const btn = document.getElementById('exportBtn');
+            btn.disabled = true;
+            document.getElementById('exportResult').innerHTML = '';
+            // Get form values
+            const subreddit = document.getElementById('exportSubreddit').value.trim();
+            const startDate = document.getElementById('exportStartDate').value;
+            const endDate = document.getElementById('exportEndDate').value;
+            const limit = document.getElementById('exportLimit').value;
+            if (!subreddit || !startDate || !endDate) {
+                document.getElementById('exportResult').innerHTML = '<span style="color:red">Please fill all fields.</span>';
+                btn.disabled = false;
+                return false;
+            }
+            // Start export
+            showExportModal('Starting export...');
+            let resp;
+            try {
+                let url = `/export_data?subreddit=${encodeURIComponent(subreddit)}&start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`;
+                if (limit) url += `&limit=${encodeURIComponent(limit)}`;
+                resp = await fetch(url);
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || 'Export failed');
+                exportSession = data.session;
+                pollExportProgress();
+            } catch (e) {
+                showExportModal('Error: ' + (e.message || 'Export failed'));
+                document.getElementById('exportCloseBtn').style.display = '';
+                btn.disabled = false;
+                return false;
+            }
+            return false;
+        }
+        function showExportModal(msg) {
+            document.getElementById('exportModal').style.display = 'flex';
+            document.getElementById('exportProgressText').innerText = msg;
+            document.getElementById('exportProgressBar').style.width = '0%';
+            document.getElementById('exportProgressCount').innerText = '';
+            document.getElementById('exportDownloadSection').style.display = 'none';
+            document.getElementById('exportDownloadSection').innerHTML = '';
+            document.getElementById('exportCloseBtn').style.display = 'none';
+        }
+        function closeExportModal() {
+            document.getElementById('exportModal').style.display = 'none';
+            document.getElementById('exportBtn').disabled = false;
+            if (exportPollInterval) clearInterval(exportPollInterval);
+        }
+        function pollExportProgress() {
+            exportPollInterval = setInterval(async () => {
+                if (!exportSession) return;
+                const resp = await fetch(`/export_progress?session=${encodeURIComponent(exportSession)}`);
+                const data = await resp.json();
+                if (data.status === 'done') {
+                    clearInterval(exportPollInterval);
+                    document.getElementById('exportProgressText').innerText = data.message || 'Export complete!';
+                    document.getElementById('exportProgressBar').style.width = '100%';
+                    document.getElementById('exportProgressCount').innerText = `Total captured: ${data.captured}`;
+                    document.getElementById('exportDownloadSection').style.display = '';
+                    document.getElementById('exportDownloadSection').innerHTML = `<a href="/download_export?session=${encodeURIComponent(exportSession)}" class="btn" style="background:#007bff; color:white; padding:0.5em 1.2em; border-radius:5px; text-decoration:none;">Download CSV</a>`;
+                    document.getElementById('exportCloseBtn').style.display = '';
+                    exportSession = null;
+                } else if (data.status === 'running') {
+                    const pct = data.total_days ? Math.round(100 * data.current_day / data.total_days) : 0;
+                    document.getElementById('exportProgressText').innerText = data.message || 'Exporting...';
+                    document.getElementById('exportProgressBar').style.width = pct + '%';
+                    document.getElementById('exportProgressCount').innerText = `Day ${data.current_day} of ${data.total_days} | Captured: ${data.captured}`;
+                } else if (data.status === 'not_started') {
+                    document.getElementById('exportProgressText').innerText = 'Waiting to start...';
+                } else {
+                    clearInterval(exportPollInterval);
+                    document.getElementById('exportProgressText').innerText = data.message || 'Export failed.';
+                    document.getElementById('exportCloseBtn').style.display = '';
+                    exportSession = null;
+                }
+            }, 1000);
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            setExportDefaultDates();
+            populateExportSubreddits();
+            showTab('summary'); // Show Summary tab by default
+        });
         // Initial load
         loadSubreddits();
     </script>

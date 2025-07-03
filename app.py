@@ -4,15 +4,20 @@ import requests
 import requests.auth
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import List, Dict
+from typing import List, Dict, Optional
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from threading import Lock
+import io, csv
+import threading
+import praw
+from praw.models import MoreComments
+from psaw import PushshiftAPI
 
 # Load environment variables
 load_dotenv()
@@ -65,6 +70,9 @@ class LabelRequest(BaseModel):
 class SubredditDeleteRequest(BaseModel):
     subreddit: str
 
+class RecategorizeRequest(BaseModel):
+    subreddit: str
+
 # Global scan progress tracker
 scan_progress = {}
 scan_progress_lock = Lock()
@@ -75,6 +83,13 @@ deep_scan_progress_lock = Lock()
 
 # Global deep scan stop flags
 deep_scan_stop_flags = {}
+
+recategorize_locks = {}
+recategorize_progress = {}
+
+export_progress = {}
+export_results = {}
+export_locks = {}
 
 # Helper: Get OAuth token
 def get_token():
@@ -625,29 +640,52 @@ def list_subreddits():
     return subreddits
 
 @app.post("/recategorize")
-def recategorize_subreddit(subreddit: str):
-    subr = str(subreddit or '').strip()
-    table = f"pain_points_{subr.lower()}"
-    cat_table = f"categories_{subr.lower()}"
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    cursor = conn.cursor()
-    # Load categories
-    cursor.execute(f"SELECT category FROM {cat_table}")
-    categories = [row[0] for row in cursor.fetchall()]
-    if not categories:
-        conn.close()
-        return {"message": f"No categories found for subreddit {subr}."}
-    # Get all problems
-    cursor.execute(f"SELECT id, problem FROM {table}")
-    rows = cursor.fetchall()
-    updated = 0
-    for row_id, problem in rows:
-        new_cat = assign_category_openai(problem, categories, subr)
-        cursor.execute(f"UPDATE {table} SET category=? WHERE id=?", (new_cat, row_id))
-        updated += 1
-    conn.commit()
-    conn.close()
-    return {"message": f"Recategorized {updated} problems in {subr} using 10-category set."}
+def recategorize_subreddit(req: RecategorizeRequest):
+    subr = str(req.subreddit or '').strip().lower()
+    if recategorize_locks.get(subr):
+        return JSONResponse({"error": "Recategorization already in progress."}, status_code=429)
+    recategorize_locks[subr] = True
+    recategorize_progress[subr] = {"status": "running", "total": 0, "done": 0, "message": ""}
+    try:
+        table = f"pain_points_{subr}"
+        cat_table = f"categories_{subr}"
+        conn = sqlite3.connect(DB_PATH, timeout=60)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT id, problem FROM {table}")
+        rows = cursor.fetchall()
+        problems = [row[1] for row in rows if row[1]]
+        ids = [row[0] for row in rows if row[1]]
+        total = len(problems)
+        recategorize_progress[subr]["total"] = total
+        if not problems:
+            conn.close()
+            recategorize_progress[subr] = {"status": "done", "total": 0, "done": 0, "message": "No problems to recategorize."}
+            return {"message": "No problems to recategorize."}
+        categories = get_or_generate_categories(subr, problems)
+        new_cats = []
+        for i, prob in enumerate(problems):
+            new_cat = assign_category_openai(prob, categories, subr)
+            new_cats.append(new_cat)
+            recategorize_progress[subr]["done"] = i + 1
+        try:
+            cursor.execute("BEGIN TRANSACTION")
+            for row_id, new_cat in zip(ids, new_cats):
+                cursor.execute(f"UPDATE {table} SET category=? WHERE id=?", (new_cat, row_id))
+            conn.commit()
+        finally:
+            conn.close()
+        recategorize_progress[subr] = {"status": "done", "total": total, "done": total, "message": f"Recategorized {total} problems with {len(categories)} categories."}
+        return {"message": f"Recategorized {total} problems with {len(categories)} categories."}
+    except Exception as e:
+        recategorize_progress[subr] = {"status": "error", "total": recategorize_progress[subr].get("total", 0), "done": recategorize_progress[subr].get("done", 0), "message": str(e)}
+        raise
+    finally:
+        recategorize_locks[subr] = False
+
+@app.get("/recategorize_progress")
+def get_recategorize_progress(subreddit: str):
+    subr = subreddit.strip().lower()
+    return recategorize_progress.get(subr, {"status": "idle", "total": 0, "done": 0, "message": ""})
 
 @app.get("/problems_for_labeling")
 def get_problems_for_labeling(subreddit: str = "", limit: int = 50):
@@ -770,7 +808,6 @@ def deep_scan_task(subreddit, start_date):
     print(f"[DeepScan] Starting deep scan for r/{subreddit} since {start_date}")
     with deep_scan_progress_lock:
         deep_scan_progress[key] = {"status": "scanning", "total_posts": 0, "posts_scanned": 0, "current_date": start_date}
-    # Parse start_date to timestamp
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
         start_ts = int(start_dt.replace(tzinfo=timezone.utc).timestamp())
@@ -780,13 +817,11 @@ def deep_scan_task(subreddit, start_date):
             deep_scan_progress[key]["status"] = "error"
             deep_scan_progress[key]["error"] = f"Invalid start_date: {start_date}"
         return
-    # Reddit API credentials from .env
     CLIENT_ID = os.getenv('REDDIT_CLIENT_ID')
     CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
     USER_AGENT = os.getenv('REDDIT_USER_AGENT')
     USERNAME = os.getenv('REDDIT_USERNAME')
     PASSWORD = os.getenv('REDDIT_PASSWORD')
-    # Get OAuth token
     def get_token():
         auth = requests.auth.HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET)
         data = {
@@ -806,7 +841,6 @@ def deep_scan_task(subreddit, start_date):
         after = None
         total = 0
         while True:
-            # Check stop flag
             if deep_scan_stop_flags.get(key):
                 print(f"[DeepScan] Stop flag detected for {key}, exiting fetch_posts loop.")
                 break
@@ -826,7 +860,6 @@ def deep_scan_task(subreddit, start_date):
             for post in posts:
                 post_data = post['data']
                 post_created = post_data.get('created_utc', 0)
-                # Stop if post is older than start_date
                 if post_created < start_ts:
                     print(f"[DeepScan] Post {post_data.get('id')} is older than start_date, stopping.")
                     return
@@ -835,7 +868,7 @@ def deep_scan_task(subreddit, start_date):
             after = data.get('after')
             if not after:
                 break
-            time.sleep(1)  # Rate limit
+            time.sleep(1)
         with deep_scan_progress_lock:
             deep_scan_progress[key]["total_posts"] = total
     def fetch_comments(post_id):
@@ -907,9 +940,7 @@ def deep_scan_task(subreddit, start_date):
             return ["NO PROBLEM"] * len(batch)
     conn = sqlite3.connect(DB_PATH)
     table = f"pain_points_{subreddit.lower()}"
-    # Ensure table exists and has correct schema
     create_table(conn, table)
-    # Print actual schema for debug
     cursor = conn.cursor()
     cursor.execute(f"PRAGMA table_info({table})")
     schema = cursor.fetchall()
@@ -918,12 +949,13 @@ def deep_scan_task(subreddit, start_date):
         print(col)
     n_problems = 0
     n_posts = 0
+    sample_problems = []
+    sample_limit = 30
+    categories = None
     try:
         for post in fetch_posts(subreddit):
-            # Check stop flag before processing each post
             if deep_scan_stop_flags.get(key):
                 print(f"[DeepScan] Stop flag detected for {key}, finishing current post and exiting main scan loop.")
-                # Do not break here; finish this post's comments, then exit
                 stop_after_this_post = True
             else:
                 stop_after_this_post = False
@@ -941,6 +973,16 @@ def deep_scan_task(subreddit, start_date):
                 for c, res in zip(batch, results):
                     if 'PROBLEM:' in res:
                         problem = res.split('PROBLEM:',1)[1].strip().strip('"')
+                        # Collect sample problems for category generation
+                        if not categories and len(sample_problems) < sample_limit:
+                            sample_problems.append(problem)
+                            if len(sample_problems) >= sample_limit:
+                                categories = get_or_generate_categories(subreddit, sample_problems)
+                        # Assign category if possible
+                        if categories:
+                            category = assign_category_openai(problem, categories, subreddit)
+                        else:
+                            category = 'Uncategorized'
                         data = {
                             'subreddit': subreddit,
                             'post_title': post_title,
@@ -948,13 +990,13 @@ def deep_scan_task(subreddit, start_date):
                             'comment_id': c['id'],
                             'author': c.get('author'),
                             'problem': problem,
-                            'context': '',  # Added context field to match schema
-                            'category': 'Uncategorized',
+                            'context': '',  # Optionally extract context if needed
+                            'category': category,
                             'upvotes': c.get('score', 0),
                             'created_at': datetime.utcfromtimestamp(c.get('created_utc', 0)).isoformat() if c.get('created_utc') else None,
                             'comment_url': f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/_/{c['id']}"
                         }
-                        print(f"[DeepScan] Saving problem for comment {c['id']}: {problem}")
+                        print(f"[DeepScan] Saving problem for comment {c['id']}: {problem} [Category: {category}]")
                         save_problem(conn, table, data)
                         n_problems += 1
             with deep_scan_progress_lock:
@@ -964,7 +1006,6 @@ def deep_scan_task(subreddit, start_date):
                 print(f"[DeepScan] Exiting after finishing post {post_id} due to stop flag.")
                 break
         summary_msg = f"✅ Deep scan complete: {n_problems} problems added from {n_posts} posts."
-        # Print row count in table for debug
         try:
             cursor = conn.cursor()
             cursor.execute(f"SELECT COUNT(*) FROM {table}")
@@ -984,6 +1025,95 @@ def deep_scan_task(subreddit, start_date):
     finally:
         conn.commit()
         conn.close()
-        # Clean up stop flag
         if key in deep_scan_stop_flags:
             del deep_scan_stop_flags[key] 
+
+@app.get("/export_data")
+def export_data(subreddit: str, start_date: str, end_date: str, limit: int = 1000000, session: Optional[str] = None):
+    """Export posts and comments for a subreddit in a date range as CSV, with progress tracking."""
+    # Parse dates
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception:
+        return JSONResponse({"error": "Invalid date format."}, status_code=400)
+    if not session:
+        session = subreddit + start_date + end_date
+    session = str(session)
+    if export_locks.get(session):
+        return JSONResponse({"error": "Export already in progress."}, status_code=429)
+    export_locks[session] = True
+    export_progress[session] = {"status": "running", "current_day": 0, "total_days": 0, "captured": 0, "message": ""}
+    def do_export():
+        try:
+            print(f"[Export] Starting export for r/{subreddit} from {start_date} to {end_date}")
+            all_rows = []
+            reddit = praw.Reddit(
+                client_id=os.environ.get('REDDIT_CLIENT_ID'),
+                client_secret=os.environ.get('REDDIT_CLIENT_SECRET'),
+                user_agent=os.environ.get('REDDIT_USER_AGENT', 'reddit-exporter')
+            )
+            start_ts = int(start_dt.timestamp())
+            end_ts = int((end_dt + timedelta(days=1)).timestamp())
+            captured = 0
+            # Fetch posts using PRAW
+            praw_subreddit = reddit.subreddit(subreddit)
+            for post in praw_subreddit.new(limit=limit):
+                if post.created_utc < start_ts:
+                    break  # Posts are in descending order; stop if before range
+                if post.created_utc > end_ts:
+                    continue  # Skip posts after end date
+                all_rows.append([
+                    post.id, 'post', str(post.author), int(post.created_utc),
+                    post.title, post.selftext, post.score, post.permalink
+                ])
+                captured += 1
+                export_progress[session]["captured"] = captured
+                # Fetch comments for each post
+                post.comments.replace_more(limit=0)
+                for comment in post.comments.list():
+                    if getattr(comment, 'body', None) is None:
+                        continue
+                    all_rows.append([
+                        comment.id, 'comment', str(comment.author), int(comment.created_utc),
+                        '', comment.body, comment.score, comment.permalink
+                    ])
+                    captured += 1
+                    export_progress[session]["captured"] = captured
+                    if limit and captured >= limit:
+                        break
+                if limit and captured >= limit:
+                    break
+            print(f"[Export] Finished. Total captured: {captured}")
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["id", "type", "author", "created_utc", "title", "body", "score", "permalink"])
+            writer.writerows(all_rows)
+            export_results[session] = output.getvalue()
+            export_progress[session]["status"] = "done"
+            if captured == 0:
+                export_progress[session]["message"] = f"No posts or comments found for r/{subreddit} from {start_date} to {end_date}."
+            else:
+                export_progress[session]["message"] = f"Export complete. {captured} items captured."
+        except Exception as e:
+            msg = f"Fatal error: {e}"
+            print(f"[Export] {msg}")
+            export_progress[session]["status"] = "error"
+            export_progress[session]["message"] = msg
+        finally:
+            export_locks.pop(session, None)
+    threading.Thread(target=do_export, daemon=True).start()
+    return {"message": "Export started.", "session": session}
+
+@app.get("/export_progress")
+def get_export_progress(session: str):
+    return export_progress.get(session, {"status": "not_started"})
+
+@app.get("/download_export")
+def download_export(session: str = ""):
+    if not session:
+        return JSONResponse({"error": "Missing session parameter."}, status_code=400)
+    csv_data = export_results.get(session)
+    if not csv_data:
+        return JSONResponse({"error": "No export found for this session."}, status_code=404)
+    return StreamingResponse(io.StringIO(csv_data), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=reddit_export_{session}.csv"}) 
